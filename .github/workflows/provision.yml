@@ -1,0 +1,41 @@
+# Auto-creates the synthetic monitor in every new ojardila site repo (rule in
+# monitor/provision.py / README.md). Runs twice an hour and on demand.
+# Secrets in THIS repo:
+#   PROVISION_TOKEN     fine-grained PAT, all ojardila repos: Contents RW,
+#                       Workflows RW, Secrets RW, Actions RW, Metadata R.
+#   TELEGRAM_BOT_TOKEN  copied into new site repos.
+#   TELEGRAM_CHAT_ID    copied into new site repos.
+# Without PROVISION_TOKEN it only reports (dry run).
+name: provision-monitors
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: [monitor/provision.py, templates/**]
+permissions:
+  contents: read
+concurrency:
+  group: provision
+  cancel-in-progress: false
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Provision
+        env:
+          GH_TOKEN: ${{ secrets.PROVISION_TOKEN || github.token }}
+          HAS_TOKEN: ${{ secrets.PROVISION_TOKEN != '' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          args=""
+          if [ "$HAS_TOKEN" != "true" ]; then echo "::warning::PROVISION_TOKEN not set: dry run"; args="--dry-run"; fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then args="--dry-run"; fi
+          python3 monitor/provision.py $args
