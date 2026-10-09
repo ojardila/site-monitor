@@ -1,0 +1,95 @@
+# Reusable synthetic monitor, called by .github/workflows/synthetic-monitor.yml
+# in each site repo. Telegram is notified only on state change (up -> down,
+# down -> up); the previous state is kept in the caller repo's Actions cache.
+name: synthetic-monitor
+on:
+  workflow_call:
+    inputs:
+      config:
+        type: string
+        default: monitor.yaml
+    secrets:
+      TELEGRAM_BOT_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: write   # save/prune the state cache
+    concurrency:
+      group: synthetic-monitor-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: ${{ inputs.config }}
+          sparse-checkout-cone-mode: false
+      - name: Fetch engine
+        run: |
+          mkdir -p .site-monitor
+          curl -fsSL https://raw.githubusercontent.com/ojardila/site-monitor/main/monitor/check.py -o .site-monitor/check.py
+      - name: Restore previous state
+        uses: actions/cache/restore@v4
+        with:
+          path: .monitor-state
+          key: monitor-state-${{ github.run_id }}
+          restore-keys: monitor-state-
+      - name: Check site
+        id: check
+        run: |
+          pip install --quiet pyyaml
+          set +e
+          python3 .site-monitor/check.py "${{ inputs.config }}"
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+      - name: Notify Telegram on state change
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p .monitor-state
+          prev=$(cat .monitor-state/state 2>/dev/null || echo up)
+          now=$(jq -r 'if .ok then "up" else "down" end' result.json)
+          name=$(jq -r .name result.json); url=$(jq -r .url result.json)
+          when=$(TZ=America/Bogota date '+%Y-%m-%d %H:%M COT')
+          echo "$now" > .monitor-state/state
+          echo "previous=$prev now=$now"
+          [ "$prev" = "$now" ] && exit 0
+          if [ "$now" = down ]; then
+            echo "$when" > .monitor-state/since
+            text=$(printf '🔴 CAÍDO: %s\n%s\nDesde: %s\n(monitor externo, GitHub Actions)\n\n%s\n\n%s' "$name" "$url" "$when" \
+              "$(jq -r '.errors[:8][] | "• " + .' result.json)" "$RUN_URL")
+          else
+            since=$(cat .monitor-state/since 2>/dev/null || echo "?")
+            text=$(printf '🟢 RECUPERADO: %s\n%s\nVolvió: %s (caído desde %s)' "$name" "$url" "$when" "$since")
+          fi
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
+            echo "::warning::TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; alert NOT sent:"; echo "$text"
+            echo unknown > .monitor-state/state; exit 0
+          fi
+          curl -fsS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=${text}" \
+            -d disable_web_page_preview=true >/dev/null \
+            || { echo "::error::Telegram send failed"; echo unknown > .monitor-state/state; }
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .monitor-state
+          key: monitor-state-${{ github.run_id }}
+      - name: Prune old state caches
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list -R "${{ github.repository }}" --key monitor-state- --limit 100 \
+            --json key,createdAt -q 'sort_by(.createdAt) | reverse | .[5:][] | .key' |
+            xargs -r -n1 gh cache delete -R "${{ github.repository }}" || true
+      - name: Fail the run when the site is down
+        if: steps.check.outputs.rc != '0'
+        run: exit 1
