@@ -54,7 +54,15 @@ jobs:
         run: |
           mkdir -p .monitor-state
           prev=$(cat .monitor-state/state 2>/dev/null || echo up)
+          fails=$(cat .monitor-state/fails 2>/dev/null || echo 0)
           now=$(jq -r 'if .ok then "up" else "down" end' result.json)
+          # Down only after 2 consecutive failed runs (each run already retries
+          # 3x); one flaky run from a GitHub runner never pages.
+          if [ "$now" = down ]; then fails=$((fails+1)); else fails=0; fi
+          echo "$fails" > .monitor-state/fails
+          if [ "$now" = down ] && [ "$fails" -lt 2 ] && [ "$prev" != down ]; then
+            echo "::warning::check failed (1/2), not alerting yet"; now="$prev"
+          fi
           name=$(jq -r .name result.json); url=$(jq -r .url result.json)
           when=$(TZ=America/Bogota date '+%Y-%m-%d %H:%M COT')
           echo "$now" > .monitor-state/state
@@ -92,4 +100,6 @@ jobs:
             xargs -r -n1 gh cache delete -R "${{ github.repository }}" || true
       - name: Fail the run when the site is down
         if: steps.check.outputs.rc != '0'
-        run: exit 1
+        run: |
+          echo "::error::$(jq -r '.errors | join(" | ")' result.json)"
+          exit 1
